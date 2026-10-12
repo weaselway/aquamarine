@@ -49,6 +49,8 @@ using namespace Hyprutils::Memory;
 using namespace Hyprutils::Math;
 #define SP CSharedPointer
 
+static bool refreshModes(SP<SDRMConnector> conn, const drmModeConnector* connector);
+
 static bool shouldSubmitCTM(SP<SDRMConnector> connector, const COutputState::SInternalState& state, bool modeset) {
     if (state.committed & COutputState::AQ_OUTPUT_STATE_CTM)
         return true;
@@ -1247,6 +1249,32 @@ void Aquamarine::CDRMBackend::recheckOutputs() {
         }
     }
 
+    // A connector can change its modes and stay connected, like a virtual display
+    // that its host resizes. Pick up the new list and have the consumer set a mode.
+    for (const auto& conn : connectors) {
+        if (conn->status != DRM_MODE_CONNECTED || !conn->output || conn->tilingRedundant)
+            continue;
+
+        // scanConnectors probed already
+        auto drmConn = drmModeGetConnectorCurrent(gpu->fd, conn->id);
+        if (!drmConn)
+            continue;
+
+        const bool changed = refreshModes(conn, drmConn);
+        drmModeFreeConnector(drmConn);
+
+        if (!changed)
+            continue;
+
+        backend->log(AQ_LOG_DEBUG, std::format("drm: Modes of {} changed:", conn->szName));
+        for (const auto& m : conn->output->modes) {
+            backend->log(AQ_LOG_DEBUG,
+                         std::format("drm: Mode {}x{}@{:.2f}Hz{}", (int)m->pixelSize.x, (int)m->pixelSize.y, m->refreshRate / 1000.0, m->preferred ? " (preferred)" : ""));
+        }
+
+        conn->output->events.state.emit(IOutput::SStateEvent{});
+    }
+
     if (!updateSecondaryRendererState())
         backend->log(AQ_LOG_ERROR, std::format("drm: Failed to update renderer state for {}", gpu->path));
 }
@@ -1881,6 +1909,33 @@ static int32_t calculateRefresh(const drmModeModeInfo& mode) {
     return refresh;
 }
 
+static SP<SOutputMode> makeMode(const drmModeModeInfo& drmMode) {
+    auto aqMode         = makeShared<SOutputMode>();
+    aqMode->pixelSize   = {drmMode.hdisplay, drmMode.vdisplay};
+    aqMode->refreshRate = calculateRefresh(drmMode);
+    aqMode->preferred   = (drmMode.type & DRM_MODE_TYPE_PREFERRED);
+    aqMode->modeInfo    = drmMode;
+    return aqMode;
+}
+
+// Replaces the output's modes if the connector's differ, returns whether it did.
+static bool refreshModes(SP<SDRMConnector> conn, const drmModeConnector* connector) {
+    std::vector<SP<SOutputMode>> modes;
+    for (int i = 0; i < connector->count_modes; ++i) {
+        if (!(connector->modes[i].flags & DRM_MODE_FLAG_INTERLACE))
+            modes.emplace_back(makeMode(connector->modes[i]));
+    }
+
+    const auto& old = conn->output->modes;
+    const bool  same =
+        std::ranges::equal(modes, old, [](const auto& a, const auto& b) { return b->modeInfo && std::memcmp(&*a->modeInfo, &*b->modeInfo, sizeof(drmModeModeInfo)) == 0; });
+    if (same)
+        return false;
+
+    conn->output->modes = std::move(modes);
+    return true;
+}
+
 drmModeModeInfo* Aquamarine::SDRMConnector::getCurrentMode() {
     if (!crtc)
         return nullptr;
@@ -2030,11 +2085,7 @@ void Aquamarine::SDRMConnector::connect(drmModeConnector* connector) {
             continue;
         }
 
-        auto aqMode         = makeShared<SOutputMode>();
-        aqMode->pixelSize   = {drmMode.hdisplay, drmMode.vdisplay};
-        aqMode->refreshRate = calculateRefresh(drmMode);
-        aqMode->preferred   = (drmMode.type & DRM_MODE_TYPE_PREFERRED);
-        aqMode->modeInfo    = drmMode;
+        auto aqMode = makeMode(drmMode);
 
         if (i == 1)
             fallbackMode = aqMode;
